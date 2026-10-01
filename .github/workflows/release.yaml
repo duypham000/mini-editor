@@ -1,0 +1,164 @@
+name: Release
+
+# Build & publish desktop (Windows) + mobile (Android) bundles to a GitHub Release
+# whenever a tag like v0.1.0 is pushed.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write # required to create / upload assets to a GitHub Release
+
+# Cancel a superseded release run if a newer tag for the same ref is pushed,
+# freeing the runners instead of building stale artifacts.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Windows installer (.exe via NSIS) — native build
+  # ---------------------------------------------------------------------------
+  windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Sync version from tag
+        shell: bash
+        run: |
+          VER="${GITHUB_REF_NAME#v}"        # v0.2.0 -> 0.2.0
+          # MSI/WiX/NSIS bundle version numeric core (strip any -prerelease / +build suffix).
+          BUNDLE_VER="${VER%%-*}"; BUNDLE_VER="${BUNDLE_VER%%+*}"
+          node -e "const f='src-tauri/tauri.conf.json';const j=require('./'+f);j.version='$BUNDLE_VER';require('fs').writeFileSync(f, JSON.stringify(j,null,2)+'\n')"
+          node -e "const f='package.json';const j=require('./'+f);j.version='$BUNDLE_VER';require('fs').writeFileSync(f, JSON.stringify(j,null,2)+'\n')"
+          echo "Tag: $VER -> bundle version: $BUNDLE_VER"
+
+      - name: Build Tauri (Windows)
+        run: pnpm tauri build
+
+      - name: Publish Windows assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: src-tauri/target/release/bundle/nsis/*.exe
+          fail_on_unmatched_files: false
+
+  # ---------------------------------------------------------------------------
+  # Android APK — release-signed with the production keystore (decoded from the
+  # ANDROID_KEYSTORE_B64 secret). Falls back to debug signing only if the secret
+  # is absent.
+  # ---------------------------------------------------------------------------
+  android:
+    runs-on: ubuntu-latest
+    env:
+      ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: gradle
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Cache Android NDK
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.ANDROID_SDK_ROOT }}/ndk/26.1.10909125
+          key: android-ndk-26.1.10909125-${{ runner.os }}
+
+      - name: Install Android NDK
+        # No-op (fast) when the NDK is restored from cache; only downloads on a miss.
+        run: |
+          sdkmanager "ndk;26.1.10909125"
+          echo "NDK_HOME=$ANDROID_SDK_ROOT/ndk/26.1.10909125" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/26.1.10909125" >> "$GITHUB_ENV"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # Only arm64-v8a (covers virtually all modern Android devices) to keep
+          # the build short. Add more ABIs here if wider device support is needed.
+          targets: aarch64-linux-android
+
+      - name: Cache Rust
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Decode release keystore
+        if: ${{ env.ANDROID_KEYSTORE_B64 != '' }}
+        shell: bash
+        run: |
+          echo "$ANDROID_KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/tomo-release.jks"
+          echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/tomo-release.jks" >> "$GITHUB_ENV"
+
+      - name: Sync version from tag
+        shell: bash
+        run: |
+          VER="${GITHUB_REF_NAME#v}"        # v0.2.0 -> 0.2.0
+          # MSI/WiX/NSIS bundle version numeric core (strip any -prerelease / +build suffix).
+          BUNDLE_VER="${VER%%-*}"; BUNDLE_VER="${BUNDLE_VER%%+*}"
+          node -e "const f='src-tauri/tauri.conf.json';const j=require('./'+f);j.version='$BUNDLE_VER';require('fs').writeFileSync(f, JSON.stringify(j,null,2)+'\n')"
+          node -e "const f='package.json';const j=require('./'+f);j.version='$BUNDLE_VER';require('fs').writeFileSync(f, JSON.stringify(j,null,2)+'\n')"
+          echo "Tag: $VER -> bundle version: $BUNDLE_VER"
+
+      - name: Build Tauri (Android APK — release, arm64-v8a, release-signed)
+        # Build only the arm64-v8a APK (the most common ABI) to shorten build time.
+        # Signed with the production keystore when ANDROID_* secrets are present
+        # (see app/build.gradle.kts); otherwise falls back to the debug keystore.
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: pnpm tauri android build --apk --split-per-abi --target aarch64
+
+      - name: Publish Android assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: src-tauri/gen/android/app/build/outputs/apk/**/*.apk
+          fail_on_unmatched_files: false
+
